@@ -1,0 +1,16 @@
+[package]
+name = "frontdoor"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = { version = "0.6.2", features = ["derive"] }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
