@@ -31,8 +31,8 @@ packr_guest::setup_guest!();
 
 mod sni;
 
-const PUBLIC_LISTEN_ADDR: &str = "0.0.0.0:443";
-const CONTROL_LISTEN_ADDR: &str = "127.0.0.1:9100";
+const DEFAULT_PUBLIC_LISTEN_ADDR: &str = "0.0.0.0:443";
+const DEFAULT_CONTROL_LISTEN_ADDR: &str = "127.0.0.1:9100";
 
 /// Cap on bytes buffered while waiting for either the ClientHello or a
 /// newline-terminated control command. Adversarial inputs that exceed
@@ -131,6 +131,15 @@ struct InitConfig {
     default_backend: Option<String>,
     #[serde(default)]
     routes: Vec<InitRoute>,
+    /// Override the public listen address. Defaults to `0.0.0.0:443`.
+    /// Useful for local smoke tests on a high port.
+    #[serde(default)]
+    public_listen_addr: Option<String>,
+    /// Override the control listen address. Defaults to
+    /// `127.0.0.1:9100`. Bound on a different loopback port for
+    /// concurrent test runs.
+    #[serde(default)]
+    control_listen_addr: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -145,7 +154,7 @@ struct InitRoute {
 fn init(state: Value) -> Result<(FrontdoorState, ()), String> {
     log(String::from("[frontdoor] init"));
 
-    let (routes, default_backend) = match state {
+    let (routes, default_backend, public_addr, control_addr) = match state {
         Value::String(s) if !s.is_empty() => {
             let cfg: InitConfig = serde_json::from_str(&s)
                 .map_err(|e| format!("initial_state must be JSON: {}", e))?;
@@ -157,20 +166,32 @@ fn init(state: Value) -> Result<(FrontdoorState, ()), String> {
                     backend: r.backend,
                 })
                 .collect::<Vec<_>>();
-            (routes, cfg.default_backend.unwrap_or_default())
+            (
+                routes,
+                cfg.default_backend.unwrap_or_default(),
+                cfg.public_listen_addr
+                    .unwrap_or_else(|| String::from(DEFAULT_PUBLIC_LISTEN_ADDR)),
+                cfg.control_listen_addr
+                    .unwrap_or_else(|| String::from(DEFAULT_CONTROL_LISTEN_ADDR)),
+            )
         }
-        _ => (Vec::new(), String::new()),
+        _ => (
+            Vec::new(),
+            String::new(),
+            String::from(DEFAULT_PUBLIC_LISTEN_ADDR),
+            String::from(DEFAULT_CONTROL_LISTEN_ADDR),
+        ),
     };
 
-    let public_listener_id = tcp_listen(String::from(PUBLIC_LISTEN_ADDR))
-        .map_err(|e| format!("listen public {}: {}", PUBLIC_LISTEN_ADDR, e))?;
-    let control_listener_id = tcp_listen(String::from(CONTROL_LISTEN_ADDR))
-        .map_err(|e| format!("listen control {}: {}", CONTROL_LISTEN_ADDR, e))?;
+    let public_listener_id = tcp_listen(public_addr.clone())
+        .map_err(|e| format!("listen public {}: {}", public_addr, e))?;
+    let control_listener_id = tcp_listen(control_addr.clone())
+        .map_err(|e| format!("listen control {}: {}", control_addr, e))?;
 
     log(format!(
         "[frontdoor] public={} control={} routes={} default={}",
-        PUBLIC_LISTEN_ADDR,
-        CONTROL_LISTEN_ADDR,
+        public_addr,
+        control_addr,
         routes.len(),
         if default_backend.is_empty() {
             "<none>"
