@@ -1,0 +1,40 @@
+# Template manifest for `frontdoor` — the Theater-native SNI router that
+# owns the VPS `:443` listener.
+#
+# This file is the in-repo TEMPLATE. The live manifest used in production
+# is rendered by sentinel (or the GitHub Actions release workflow) and
+# substitutes the `package` URL + initial-state JSON for the deploy.
+
+name = "frontdoor"
+version = "0.1.0"
+package = "/workspace/target/wasm32-unknown-unknown/release/frontdoor.wasm"
+
+[[handler]]
+type = "runtime"
+
+[[handler]]
+type = "tcp"
+
+# Frontdoor never spawns child actors in v0 (singleton design — see
+# DESIGN.md §6) but it IS supervised BY sentinel, so the supervisor
+# handler is still needed for chain bookkeeping.
+[[handler]]
+type = "supervisor"
+
+# Optional initial_state JSON shape, passed by sentinel at spawn time:
+#
+#   {
+#     "default_backend": "127.0.0.1:8443",
+#     "routes": [
+#       { "hostname": "mail.colinrozzi.com",    "backend": "127.0.0.1:8443" },
+#       { "hostname": "tickets.colinrozzi.com", "backend": "127.0.0.1:8444" },
+#       { "hostname": "inbox.colinrozzi.com",   "backend": "127.0.0.1:8445" }
+#     ]
+#   }
+#
+# Live updates can be pushed via newline-delimited JSON on the control
+# port (127.0.0.1:9100). Supported ops:
+#   {"op":"upsert_route","hostname":"...","backend":"..."}
+#   {"op":"delete_route","hostname":"..."}
+#   {"op":"set_default","backend":"..."}
+#   {"op":"list_routes"}
