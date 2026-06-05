@@ -1,0 +1,54 @@
+# Sentinel-renderable manifest template for the frontdoor actor.
+#
+# Substitution placeholders (handled by sentinel's spawn_child path,
+# same convention as sentinel/inbox-acceptor.template.toml):
+#
+#   __PACKAGE__         the wasm URL — sentinel renders from the child's
+#                       `default_package` field (e.g.
+#                       https://github.com/colinrozzi/frontdoor/releases/download/release-YYYYMMDD-XXX/frontdoor-YYYYMMDD-XXX.wasm).
+#
+#   __FRONTDOOR_CFG__   the JSON initial_state for frontdoor, sourced from
+#                       sentinel's `children.frontdoor.secrets.FRONTDOOR_CFG`.
+#                       Expected shape:
+#
+#                         {
+#                           "default_backend": "127.0.0.1:8443",
+#                           "routes": [
+#                             { "hostname": "mail.colinrozzi.com",    "backend": "127.0.0.1:8443" },
+#                             { "hostname": "inbox.colinrozzi.com",   "backend": "127.0.0.1:9443" },
+#                             { "hostname": "tickets.colinrozzi.com", "backend": "127.0.0.1:9444" }
+#                           ],
+#                           "public_listen_addr":  "0.0.0.0:443",
+#                           "control_listen_addr": "127.0.0.1:9100"
+#                         }
+#
+#                       All four top-level fields are optional. Omitting
+#                       `public_listen_addr` / `control_listen_addr`
+#                       falls back to the hardcoded defaults
+#                       (`0.0.0.0:443` / `127.0.0.1:9100`). Omitting
+#                       `default_backend` causes any TLS connection that
+#                       lacks a matching route — or has no SNI — to be
+#                       dropped.
+#
+# All `"` inside `__FRONTDOOR_CFG__` must be TOML-escaped (`\"`) by
+# sentinel's substitution path before the rendered TOML is handed to
+# theater. inbox-acceptor's template already does this for its
+# `__BEARER_TOKEN__` / `__DKIM_PRIVATE_KEY__` slots; same shape.
+
+name = "frontdoor"
+version = "0.1.0"
+package = "__PACKAGE__"
+
+[[handler]]
+type = "runtime"
+
+[[handler]]
+type = "tcp"
+
+# frontdoor is sentinel-supervised but has no children of its own in v0
+# (singleton actor — see DESIGN.md §6). The supervisor handler is still
+# wired for chain bookkeeping with sentinel.
+[[handler]]
+type = "supervisor"
+
+initial_state = "__FRONTDOOR_CFG__"
