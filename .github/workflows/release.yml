@@ -49,10 +49,9 @@ jobs:
           cp "$(realpath result)/frontdoor.wasm" "${WASM_FILE}"
           chmod +w "${WASM_FILE}"
 
-          # Sentinel-renderable manifest with a self-referencing
-          # package URL. Initial state + routing table are stamped in
-          # at deploy time by sentinel; this template just wires the
-          # handler stanzas.
+          # Direct-spawn manifest. Self-referencing `package` URL +
+          # no `initial_state`. Use this with `theater spawn` from a
+          # local checkout for smoke testing.
           MANIFEST_FILE="frontdoor-${STAGE_TAG}.toml"
           WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/${WASM_FILE}"
           cat > "${MANIFEST_FILE}" <<TOML
@@ -70,6 +69,16 @@ jobs:
           type = "supervisor"
           TOML
 
-          gh release upload "$TAG" "${WASM_FILE}" "${MANIFEST_FILE}"
+          # Sentinel-renderable variant: __PACKAGE__ + __FRONTDOOR_CFG__
+          # placeholders for sentinel's substitution path. Sentinel pins
+          # the wasm via `children.frontdoor.default_package` and renders
+          # `initial_state` from `secrets.FRONTDOOR_CFG`. Kept in sync
+          # with sentinel/frontdoor.template.toml at HEAD by copying it
+          # into the release verbatim.
+          SENTINEL_TEMPLATE_FILE="frontdoor-${STAGE_TAG}.sentinel.toml"
+          cp sentinel/frontdoor.template.toml "${SENTINEL_TEMPLATE_FILE}"
+          chmod +w "${SENTINEL_TEMPLATE_FILE}"
+
+          gh release upload "$TAG" "${WASM_FILE}" "${MANIFEST_FILE}" "${SENTINEL_TEMPLATE_FILE}"
         env:
           GH_TOKEN: ${{ github.token }}
