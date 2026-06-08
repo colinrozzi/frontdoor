@@ -1,7 +1,7 @@
 # frontdoor — v0 design
 
 **Owner:** frontdoor-dev@colinrozzi.com
-**Status:** v0 shipped (PRs #1–#5, releases through `release-20260605-63d75f2`); pivoting actor-model to **per-connection child actor** after 2026-06-07 cutover stall. See §6 for the new shape, §6.a for the stall analysis, §6.c for the theater-dev API requirement that unblocks it. Pre-pivot text retained for context; sections marked **[v0 superseded]** describe the original singleton model that the §6 pivot replaces.
+**Status:** v0 shipped (PRs #1–#5, releases through `release-20260605-63d75f2`); pivoting actor-model to **per-connection child actor** after 2026-06-07 cutover stall. Subscription opt-out shipped 2026-06-08 (theater 0.3.25 / theater-handler-supervisor 0.3.16 — §6.c.i). **Per-conn-child implementation now gated on a new TCP-handler FD-handoff primitive that doesn't exist yet (§6.c.ii)** — Colin call. See §6 for the new shape, §6.a for the stall analysis. Sections marked **[v0 superseded]** describe the original singleton model that the §6 pivot replaces.
 
 ## 1. Goals
 
@@ -43,13 +43,14 @@ connect(addr) → outbound connection_id
 close(conn)
 close-listener(listener_id)
 set-active(conn, mode)                      ("active" | "once" | "passive")
-transfer(conn, target_actor)                (hand connection to another actor)
 upgrade-to-tls-server(conn)
 upgrade-to-tls-client(conn, server_name)
 peer-address(conn)
 ```
 
-Notable for frontdoor: `connect(addr) → connection_id` is the outbound primitive (Q3.2 confirmed); `set-active(conn, "active")` flips a connection into callback-driven mode so the host dispatches `tcp-client.on-data` to the actor when bytes arrive (no actor-side polling); `transfer(conn, target_actor)` exists as a first-class primitive but frontdoor v0 doesn't use it (see §6).
+Notable for frontdoor: `connect(addr) → connection_id` is the outbound primitive (Q3.2 confirmed); `set-active(conn, "active")` flips a connection into callback-driven mode so the host dispatches `tcp-client.on-data` to the actor when bytes arrive (no actor-side polling).
+
+**FD-handoff is NOT currently a primitive** (theater-dev 2026-06-08): "The tcp handler owns its listener and yields connections to the same actor that called accept; 'transfer to a child' needs design we don't have yet." An earlier version of this section listed `transfer(conn, target_actor)` — that was incorrect. A `hand-off-connection(conn-id, target-actor-id)` primitive (or equivalent — semantics TBD) is the actual gate on §6 per-conn-child implementation. See §6.c for the current ask to theater-dev.
 
 ### 3.1 SNI peek + forward (per inbound connection)
 
@@ -257,7 +258,7 @@ The acceptor opts out of subscribing to the per-conn children's chain events (§
 | state size in acceptor | O(in-flight conns) | O(in-flight children) entries in `children` set (no per-conn buffers / pipes) |
 | code path under load | one actor handles all on-data callbacks serially | per-conn actors run independently; backend latency on one conn doesn't head-of-line block others |
 | extra cost | n/a | per-accept actor spawn/teardown (wasm component init + manifest fetch — fetch is cached, init is ~ms order) |
-| new theater capability needed | none | opt-in subscription on `supervisor.spawn` (§6.c) |
+| new theater capability needed | none | opt-in subscription (shipped 2026-06-08 in theater 0.3.25) + FD-handoff primitive (not yet — §6.c.ii is the actual blocker) |
 
 The per-conn cost is the only real downside, and it pays off the moment a connection storm appears (which is exactly what reproduced the wedge — see §6.a).
 
@@ -292,31 +293,47 @@ The 2026-06-07 cutover stall flipped both of these. The amplification reproduced
 
 Both are in theater-dev's plan but were blocked on Colin's "repro first" call at v0 design time. (Repro happened 2026-06-07; the response is the §6 pivot, not a singleton patch.)
 
-### 6.c Theater-dev API requirement — opt-in subscription on `supervisor.spawn`
+### 6.c Theater-dev API: opt-in subscription (SHIPPED) + FD-handoff (NEW GATE)
 
-The per-conn child model assumes a `supervisor.spawn` API that lets the parent opt out of subscribing to the child's chain events. Theater-dev is designing this now; frontdoor is the highest-volume use case for it.
+Two distinct theater-side dependencies. Subscription opt-out is shipped as of theater 0.3.25 / theater-handler-supervisor 0.3.16; connection handoff is the remaining gate on implementation.
 
-**What frontdoor needs:**
+#### 6.c.i Opt-in subscription — theater 0.3.25 (shipped 2026-06-08)
 
-1. **Spawn-without-subscribe (deliver-level opt-out).** The acceptor calls `supervisor.spawn(per-conn-manifest, init_state, { subscribe: false })` (or equivalent — exact API shape TBD with theater-dev). Result: parent never receives `handle-child-event` callbacks for that child's chain events.
+Theater PR #108 + release #109 made child-event subscription opt-IN by default. Previously `spawn` attached a parent subscriber automatically; now it doesn't. Parents that want chain events call (post-spawn, per child):
 
-2. **No parent-side recording of the (non-existent) deliveries.** Because no `handle-child-event` is delivered, the parent's chain has no `wasm-call("handle-child-event", ...)` entries to record. The amplification (which is a *recording* effect on the parent's chain) is gone by construction. *Confirm this falls out naturally — frontdoor doesn't need a separate `record_child_events = false` knob if `subscribe: false` already implies no delivery.*
+```
+subscribe-to-child:     func(child-id: string) -> result<_, string>
+unsubscribe-from-child: func(child-id: string) -> result<_, string>
+```
 
-3. **Parent still gets `on-child-exit` (or equivalent supervisor lifecycle event).** The acceptor needs to know when a child exits, for the `children: Set<actor_id>` accounting + log line. This is **one** event per child lifetime, not per-event-on-child-chain — small, bounded. If the spawn opt-out also suppresses lifecycle events, that's a problem; frontdoor needs the exit hook.
+Both idempotent; error if `child-id` isn't tracked by the calling supervisor. For frontdoor: acceptor spawns, never subscribes — done. No new spawn arg, no `record_child_events=false` knob needed.
 
-4. **`transfer(conn, child)` works against a freshly-spawned child.** Acceptor needs to hand the just-accepted connection to the just-spawned child. From §3.0 this primitive exists already; what the v1 design needs to confirm is that the target child receives the connection in `handle-connection` (or via some other entrypoint) *after* its `init` completes, not racing with it.
+Maps onto the earlier (a)–(e) questions:
 
-5. **Per-conn-child chain disk write — is it bounded?** Theater's `ChainWriter` streams each actor's chain to `chains/{actor_id}.chain`. With per-accept-spawn, each TCP connection produces one chain file. Over time these accumulate on disk. **Question for theater-dev:** does theater GC per-actor chain files when the actor exits, or do they pile up forever? If they pile up, frontdoor adds a per-deploy housekeeping step; not blocking the design, but worth a yes/no.
+- **(a) API shape** — neither variant; subscription is post-spawn host calls, not a spawn arg. Frontdoor's per-conn case is the trivial "spawn, never subscribe" path.
+- **(b) Recording amplification eliminated by construction.** With no subscriber, the dispatch loop never enters the `.send().await` path for the parent, so `handle-child-event` never fires on the parent, so the parent's chain has no `wasm-call("handle-child-event", ..., child-event-data)` to record. No separate knob needed.
+- **(c) Lifecycle events ride a separate always-on channel** (`handle-child-error`, `handle-child-exit`, `handle-child-external-stop` via the `ActorResult` channel). Opt-in subscription only gates `handle-child-event`. Acceptor's exit accounting (`children: Set<actor_id>`) works regardless of subscription state. ✓
+- **(e) Chain is in-memory only post-PR #105.** Events dispatched and dropped; no `chains/{actor_id}.chain` on disk by default. Per-conn children with no subscriber and no replay handler produce zero disk accumulation. The §11 follow-up about per-conn chain GC is **removed** — there is no GC problem to solve.
 
-**Questions to theater-dev (PR review will pick this up):**
+#### 6.c.ii FD-handoff — NOT a current primitive (the actual blocker)
 
-- (a) API shape: an extra arg on `supervisor.spawn` vs. a new `spawn-detached` variant — preference?
-- (b) Does `subscribe: false` (or whatever it's called) cleanly avoid the recording amplification, or is a separate `record_child_events = false` still needed on the supervisor handler?
-- (c) Confirm `on-child-exit` (or equivalent) still fires even when chain-event subscription is disabled.
-- (d) `transfer(conn, child)` post-spawn timing — what's the entrypoint the child sees, and is there a race vs. `init`?
-- (e) Per-actor chain file lifecycle on disk — exit-cleanup, retention, or operator's job?
+Theater-dev 2026-06-08: "FD transfer between actors isn't a current primitive. The tcp handler owns its listener and yields connections to the same actor that called accept; 'transfer to a child' needs design we don't have yet. This is a Colin call — likely a new host function on `theater:simple/tcp` (something like `hand-off-connection(conn-id, target-actor-id)`), with semantics for whether the target receives it via a special init param, a callback handler, or a queued message."
 
-None of these block opening the per-conn-child PR; the spawn-API question is the only one that gates the implementation, and theater-dev's opt-in-subscription work is in flight.
+Implication: the §3.b "acceptor accepts → spawns child → transfers conn" sketch cannot be implemented today. The accepted connection is bound to the acceptor's actor identity; there is no primitive that gives a child actor ownership of a connection accepted by its parent.
+
+**Options on the table** (all need theater-dev / Colin design input):
+
+1. **New primitive `hand-off-connection(conn-id, target-actor-id)`** on `theater:simple/tcp`. Cleanest for frontdoor. Semantics question (for theater-dev / Colin): does the target receive the connection (a) via a new init param at spawn time, (b) via a new callback handler (e.g. `tcp-client.handle-handed-off-connection`), or (c) via a queued tcp-client.handle-connection like a fresh accept? Each has its own state-machine implications on the child side.
+2. **Child-side `accept` on a per-conn listener.** Acceptor binds the public `:443` listener, but each accept handed back returns enough info that the acceptor can spawn a child that performs its OWN `accept` somehow against that connection. Probably doesn't fit theater's actor model cleanly.
+3. **Acceptor stays in the bytes path, but spawns per-conn children that only do CPU work** (SNI parse, route lookup). Acceptor handles all I/O. *This DOESN'T solve the chain-amplification problem* — the acceptor's chain still records every on-data callback for every byte chunk on every connection. Rejected.
+
+Option 1 is the only one that actually delivers the §6 design goal (acceptor's chain only sees spawn+exit, never per-byte events). Frontdoor's implementation is blocked until that primitive — or an equivalent — exists.
+
+#### 6.c.iii Status / next steps
+
+- **Subscription opt-out: done.** Once theater 0.3.25 is in the flake, the acceptor just doesn't call `subscribe-to-child` after its spawns.
+- **FD-handoff primitive: needs design.** Escalating to manager + Colin as the gating ask, since theater-dev flagged it's not in their lane — it's a "design we don't have yet" call.
+- **PR #6 (this DESIGN doc) stays draft** until the FD-handoff primitive design lands. The §3.b sketch is conditional on whichever Option 1 sub-variant Colin picks; once that's known, §3.b can be tightened to match the actual host-side semantics (init-param vs. callback vs. queued accept).
 
 ## 7. ACME / cert provisioning
 
@@ -378,7 +395,6 @@ Build + deploy:
 ## 11. Open follow-ups (post-v1)
 
 - **`splice(in, out)` host primitive** — bidirectional host-side byte pump, no wasm round-trips per chunk. Theater-dev estimates ~150 LOC in `theater-handler-tcp` + new function in `tcp.pact`. Bigger win under v1 (per-conn-child does the forwarding) than it would have been under v0 — each child still pays the host↔wasm crossing per chunk today. Ship v1 first, profile, add splice if crossings show up as the bottleneck.
-- **Per-conn child chain GC.** If theater doesn't GC per-actor chain files on disk when actors exit (§6.c.5), frontdoor on a busy VPS could fill the chains directory. Operator-side cron sweep or a theater-side fix — defer until measured.
 - **Half-close primitive (`shutdown-write(conn)`)** — only if a routed protocol surfaces a need. Current API closes both directions, which is fine for TLS-encrypted streams.
 - Wildcard SNI routes.
 - Active backend health checks + fast-fail.
@@ -392,7 +408,6 @@ Build + deploy:
 - **Spawn-rate ceiling.** Per-conn-child model spawns one wasm actor instance per accepted TCP connection. If accept rate is high (a scanner storm of 1000+ conn/sec), actor spawn becomes the hot path. Theater's actor spawn cost is ~ms order today (manifest fetch is cached after the first spawn; wasm instantiation is the dominant cost). Mitigation if it bites: cap accept rate at the acceptor (don't `accept` faster than a configured threshold), or batch-spawn pre-warmed children. Defer until measured under real traffic.
 - **Cutover from `inbox-acceptor` owning `:443`.** The swap drops in-flight TLS connections at the moment inbox-acceptor unbinds. Mitigation: schedule during low-traffic window, coordinate with inbox-dev and sentinel-dev. Cutover proper is already gated on this redesign per manager id=38.
 - **Adversarial ClientHellos** (intentionally fragmented, oversized, malformed) could DoS the SNI-parsing path on the per-conn child. The blast radius shrinks dramatically vs. v0 — only that child crashes, not the acceptor. Mitigation: bound buffer size + read-count, close on parse failure, log + exit (§3.a).
-- **Per-conn child chain files on disk** — see §6.c.5. Unbounded accumulation if theater doesn't GC. Operator-side cron sweep is a stopgap; flag for theater-dev follow-up.
-- **Opt-in subscription API not yet shipped.** v1 implementation blocked on theater-dev's spawn-without-subscribe API (§6.c). Mitigation: implementation can scaffold against a placeholder API and adapt to the final shape during PR review. The architectural shape (two crates, transfer-on-accept, route snapshot) is independent of the exact spawn-API call site.
+- **FD-handoff primitive doesn't exist yet (§6.c.ii).** v1 implementation blocked on a new theater host function — likely `hand-off-connection(conn-id, target-actor-id)` on `theater:simple/tcp`. This is the real gate, not the subscription API (which shipped 2026-06-08 in theater 0.3.25). Mitigation: nothing actionable until theater-dev / Colin land the primitive design; the design doc captures the dependency clearly so theater-side scoping has the constraint.
 
 — end —
