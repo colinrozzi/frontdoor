@@ -1,7 +1,7 @@
 # frontdoor — v0 design
 
 **Owner:** frontdoor-dev@colinrozzi.com
-**Status:** proposal awaiting Colin sign-off on architecture. TCP primitive sufficiency (§3) confirmed by theater-dev 2026-05-31.
+**Status:** v0 shipped (PRs #1–#5, releases through `release-20260605-63d75f2`); pivoting actor-model to **per-connection child actor** after 2026-06-07 cutover stall. See §6 for the new shape, §6.a for the stall analysis, §6.c for the theater-dev API requirement that unblocks it. Pre-pivot text retained for context; sections marked **[v0 superseded]** describe the original singleton model that the §6 pivot replaces.
 
 ## 1. Goals
 
@@ -105,38 +105,85 @@ Practical: a single TCP read often delivers the whole ClientHello (~200-600 byte
 
 If SNI is absent (rare — TLS clients without SNI), frontdoor falls back to a configured `default_backend` if set, else closes the connection.
 
-### 3.b Connection lifecycle — singleton actor with per-connection state
+### 3.b Connection lifecycle — singleton acceptor + per-connection child actor
+
+Per §6, frontdoor v1 splits across two actors: a **singleton acceptor** that owns the listeners + route table + control channel, and a **per-connection child actor** spawned for every accepted TCP connection. The acceptor never sees the connection's bytes; the child does the SNI peek, backend connect, and bidirectional bridge.
 
 ```
-listener-actor (singleton; supervises nothing)
+frontdoor-acceptor (singleton; supervisor of all per-conn children)
   state:
-    listener_id
+    public_listener_id
+    control_listener_id
     routes: HashMap<hostname, backend_addr>
     default_backend: Option<backend_addr>
-    pending: HashMap<connection_id, BufferState>          // mid-SNI-parse
-    pipes:   HashMap<connection_id, connection_id>        // active = inbound→outbound and outbound→inbound
+    children: Set<actor_id>                  // for spawn/exit accounting only
 
-  on tcp.accept(listener_id) → inbound:
-    activate(inbound); set-active(inbound, "active")
-    pending[inbound] = BufferState { buf: Vec<u8> }
+  on tcp.accept(public_listener_id) → inbound:
+    child_init = { conn_id: inbound, routes: snapshot(routes), default_backend }
+    child = supervisor.spawn-detached(per-conn-manifest, child_init)   // see §6.c
+    transfer(inbound, child)                  // hand connection ownership over
+    children.insert(child)
+
+  on tcp.accept(control_listener_id) → control_conn:
+    activate(control_conn); set-active(control_conn, "active")
+    // control connections stay on the singleton — small volume, route mutations
+    pending_control[control_conn] = BufferState { buf: Vec<u8> }
+
+  on tcp-client.on-data(control_conn, bytes):
+    accumulate + dispatch newline-delimited JSON; mutate `routes` / `default_backend`.
+
+  on supervisor.on-child-exit(child):
+    children.remove(child)
+    // No per-connection chain event has flowed through the acceptor's chain
+    // because the spawn opted out of subscription (§6.c). The only chain
+    // entries from this connection are the spawn + the exit notification.
+
+frontdoor-conn (one instance per inbound TCP connection; exits on EOF)
+  init(child_init):
+    state = { conn_id, routes, default_backend, buf: Vec<u8>, outbound: None }
+
+  on tcp-client.handle-connection(conn_id):   // fires after transfer
+    activate(conn_id); set-active(conn_id, "active")
 
   on tcp-client.on-data(conn, bytes):
-    if conn in pending:
-      pending[conn].buf.extend(bytes)
-      try parse SNI; on incomplete: continue; on parse fail: close(conn); del pending
-      backend_addr = routes[sni] or default_backend or { close; return }
-      outbound = connect(backend_addr) or { close(inbound); return }
-      send(outbound, pending[conn].buf)
-      set-active(outbound, "active")
-      pipes[inbound] = outbound; pipes[outbound] = inbound
-      del pending[conn]
-    else if conn in pipes:
-      if bytes.empty:                      // EOF
-        peer = pipes[conn]; close(conn); close(peer)
-        del pipes[conn]; del pipes[peer]
-      else:
-        send(pipes[conn], bytes)
+    if outbound.is_none():
+      buf.extend(bytes)
+      match sni::parse(&buf):
+        Incomplete -> wait for more bytes (bounded by PENDING_BUFFER_CAP)
+        Found(host) -> backend = routes[host] or default_backend or { exit }
+                       outbound = tcp.connect(backend) or { exit }
+                       set-active(outbound, "active")
+                       send(outbound, buf); buf.clear()
+        Absent     -> backend = default_backend or { exit }; same connect+replay path
+        Malformed  -> exit
+    else:
+      // mid-stream byte; forward to peer
+      peer = (conn == inbound) ? outbound : inbound
+      send(peer, bytes) or { exit }
+
+  on tcp-client.on-close(conn, reason):
+    close the peer if open; actor exits.
 ```
+
+The per-conn child's state is small and dies with the actor; no `HashMap` of pipes, no `Vec` of pending, just two `connection_id`s and a buffer. The acceptor's state is the route table + the small `children` set.
+
+#### 3.b.i What stays on the acceptor
+
+- Both listeners (`public` + `control`).
+- The route table and `default_backend`.
+- Control-channel state machine (newline-delimited JSON, route mutations).
+- The supervised set of per-conn children, only for liveness accounting.
+
+#### 3.b.ii What moves to the per-conn child
+
+- The SNI parse + the buffered ClientHello bytes.
+- The outbound `tcp.connect` to the backend.
+- Active-mode `on-data` bidirectional forwarding.
+- All `tcp_close` calls for the inbound + outbound pair.
+
+#### 3.b.iii Route snapshot semantics
+
+The child receives a **snapshot** of the routes at spawn time via `init_state`. In-flight connections are unaffected by live `upsert_route` / `delete_route` commands — once a connection is alive on a per-conn child, its routing lookup uses the snapshot it was spawned with. This matches the v0 in-flight semantics in §4.b and keeps the child genuinely independent of the acceptor mid-stream. Subsequent accepts spawn children with the freshly-mutated snapshot.
 
 ## 4. Routing table
 
@@ -192,49 +239,84 @@ Three sub-cases on the outbound connect:
 
 **No backend retries.** If `127.0.0.1:8443` refuses, the client retries the public `:443`; frontdoor will try again on the next ClientHello and likely succeed if the backend came back. No internal retry, no exponential backoff, no circuit-breaker — these all add complexity that doesn't pay off until we have measured failure modes.
 
-## 6. Actor model — singleton with active-mode callbacks
+## 6. Actor model — singleton acceptor + per-connection child
 
-**v0 picks the singleton model.** One frontdoor actor binds `:443`, owns the listener, and handles all connections through active-mode callbacks. State is the `pending` + `pipes` `HashMap`s sketched in §3.b. No child actors are spawned per connection.
+**v1 (current) picks the per-connection child model**, after the 2026-06-07 cutover reproduced the chain-growth wedge under TCP load (§6.a). One singleton **acceptor** owns the public listener + control listener + route table. Every accepted public TCP connection spawns a **per-connection child** that owns the SNI peek + backend connect + bidirectional bridge for that one connection, and exits when the connection tears down.
 
-Considered and rejected for v0 — per-connection child actor (one actor instance per inbound TLS connection, using `transfer(conn, child)` to hand the accepted socket over). Theater-dev: "pick based on isolation taste; chain-bounding work covers either choice." Two reasons singleton wins for v0:
+The acceptor opts out of subscribing to the per-conn children's chain events (§6.c) so:
+- the child's per-connection chain (tcp events, sni parse, etc.) never flows into the acceptor's chain via `handle-child-event` recording;
+- the acceptor's own chain only records `spawn child X` + `child X exited` per connection — tiny payloads, ~hundreds of bytes;
+- sentinel only sees the acceptor's small chain, not the high-volume per-conn chains.
 
-1. **Chain-growth pragmatism.** Per-connection actor under sentinel introduces the grandchild-supervisor-recording amplification theater-dev diagnosed: `sentinel ← frontdoor-listener ← conn-actor`, with each `handle-child-event` invocation recorded as a `wasm-call` chain entry on every level. Singleton eliminates that amplification entirely — frontdoor has only its own chain + the existing one-level bubble-up into sentinel. Until chain-eviction (Tier 1) and `record_child_events = false` (Tier 3) ship, singleton is strictly safer.
-2. **Smaller v0 surface.** Singleton is one actor entrypoint, one manifest, one supervised process. Per-connection requires modeling actor spawn/teardown + handling `transfer()` semantics. Both are shippable, but per-connection is more work for v0.
+### 6.0 What the per-conn child split buys vs. the singleton model
 
-**v1 path** — refactor to per-connection child actor for better isolation (a bug in handling one connection can't corrupt the pipes table for others) once **both** of these land:
-- Theater chain-eviction (Tier 1) — bounds per-actor chain memory.
-- Theater `record_child_events = false` manifest knob (Tier 3) — frontdoor listener can flip this on its own supervisor handler, eliminating grandchild amplification into its chain. Sentinel sets the same flag on its handler for frontdoor.
+| concern | singleton (v0, superseded) | per-conn child (v1) |
+|---|---|---|
+| acceptor chain growth per connection | 4–8 chain entries (accept, on-data ×N, connect, on-close), payloads include forwarded byte chunks | 2 chain entries (spawn, exit), constant payload |
+| crash blast radius | bug in one conn corrupts singleton's `pipes`/`pending` HashMaps → all in-flight conns dropped | bug in one conn kills only that child; acceptor + other children unaffected |
+| state size in acceptor | O(in-flight conns) | O(in-flight children) entries in `children` set (no per-conn buffers / pipes) |
+| code path under load | one actor handles all on-data callbacks serially | per-conn actors run independently; backend latency on one conn doesn't head-of-line block others |
+| extra cost | n/a | per-accept actor spawn/teardown (wasm component init + manifest fetch — fetch is cached, init is ~ms order) |
+| new theater capability needed | none | opt-in subscription on `supervisor.spawn` (§6.c) |
 
-Both are in theater-dev's plan but blocked on Colin's "repro first" call (§6.a). Re-evaluate when the chain-bounding work ships.
+The per-conn cost is the only real downside, and it pays off the moment a connection storm appears (which is exactly what reproduced the wedge — see §6.a).
 
-### 6.a Chain-growth context
+### 6.a The 2026-06-07 cutover stall — wedge reproduced under load
 
-Singleton means frontdoor contributes only its own chain to the system, not a tree. The wedge-amplification diagnosis below still drives the design — it's why singleton is the v0 choice — but the concrete chain-bounding configuration is much simpler than the earlier per-connection-actor draft assumed.
+Phase 2 of the prod cutover (sentinel takes over `:443` with frontdoor singleton in front of inbox-acceptor) stalled reproducibly under TCP load. A brief connection storm to the public `:443` listener (single IP, 100+ TCP connections in ~2 min, classifier shape) generated enough chain events on frontdoor's singleton chain that sentinel's subscriber couldn't drain the channel. Producer back-pressure then stalled the actor tree: mailbox-router's spawn loop, etc.
 
-#### 6.a.i Theater-dev's diagnosis (2026-05-31)
+This converts §6.a (formerly hypothetical, gated on Colin's "repro first" call) into a confirmed mechanism: the singleton model channels per-connection traffic through a single chain that is exactly the kind of high-throughput producer the chain-amplification path can't keep up with. Per-conn child model breaks the amplification at the source — each child is its own chain, ephemeral, and crucially **unsubscribed by the parent**, so the recording amplification (parent's chain recording `wasm-call("handle-child-event", child_id, X.data)` with `X.data` embedded) is eliminated by construction.
 
-Manager flagged a wedge-root-cause hypothesis: sentinel's chain-file on the VPS accumulates ~50MB/min, and a 2.9GB in-memory chain is plausibly causing the daily wedge. Theater-dev surveyed the chain paths and confirmed the mechanism + landed a concrete fix plan:
+Phase 1 (new theater + new sentinel without frontdoor cutover) is live. Phase 2 was rolled back; the cutover proper waits on this redesign.
 
-**Root cause** — `StateChain.events: Vec<ChainEvent>` (`crates/theater/src/chain/mod.rs:255`) grows for the life of the actor with no bound. ChainWriter already streams every event to disk, so the in-memory Vec is redundant for durability; it exists for `verify()` / `get_events()`.
+#### 6.a.i Theater-dev's earlier diagnosis — still load-bearing
 
-**Amplification** — sentinel doesn't actually subscribe to grandchildren; it's a RECORDING amplification: when a child invokes `handle-child-event`, the runtime records the call as `wasm-call("handle-child-event", child_id, event_type, X.data)` with the grandchild's payload embedded. That recorded event bubbles up through each supervisor level, embedding the prior level's embedded payload — three-level nesting per delivery.
+The chain growth + amplification mechanism theater-dev described 2026-05-31 still drives this design: `StateChain.events: Vec<ChainEvent>` grows unbounded; supervisor's `handle-child-event` recordings embed the grandchild payload at each level, producing three-level nesting per delivery. The per-conn-child + opt-out-subscription combination is the structural fix, not a workaround.
 
-**Theater-dev's fix plan:**
+(Tier 1 chain-eviction + Tier 3 `record_child_events = false` from theater-dev's earlier three-tier plan are still useful as defense-in-depth — they bound chain memory and remove parent recording in cases where opt-out isn't an option. But the v1 frontdoor design doesn't depend on them; it sidesteps the amplification entirely.)
 
-- **Tier 1 (this week, ~150 LOC + tests):** per-actor config `chain.in_memory_max_events`, default unbounded for back-compat. Evicts from front of Vec when exceeded. Disk-side ChainWriter unchanged.
-- **Tier 2 (couple weeks, breaking chain format change):** stop embedding child-event payloads in supervisor's wasm-call params. Chain entry references `(child_id, event_type, event_hash)` only; child's chain holds the payload. Collapses parent growth from O(events × payload × depth) to O(events × depth).
-- **Tier 3 (manifest knob, after tier 2):** `[handler.supervisor] record_child_events = false`. Supervisor still invokes the callback; runtime doesn't record the invocation. Zero-overhead for supervisors that use `handle-child-event` to react (e.g. sentinel reacting to crashes), not to audit.
+### 6.b [v0 superseded] singleton model + chain-bounding configuration
 
-#### 6.a.ii Frontdoor's chain-bounding configuration
+(Retained for context; the v1 §6/§6.a above replaces this analysis. The §6.b.i chain-bounding configuration only matters if a v2 ever wants the singleton back.)
 
-Because frontdoor is singleton (no per-connection child actors), there's no nesting amplification within frontdoor — only the one-level bubble-up into sentinel that any supervised actor produces. Two configurations matter:
+Until 2026-06-07, the v0 design picked the singleton model for two reasons:
+1. **Chain-growth pragmatism** under the singleton-vs-per-conn trade — at v0 design time, the wedge mechanism was hypothesized but unreproduced, and the per-conn refactor depended on theater Tier 1 + Tier 3 landing.
+2. **Smaller v0 surface** — one actor entrypoint, one manifest, no `transfer()` / spawn lifecycle modeling.
 
-1. **`chain.in_memory_max_events`** on frontdoor's manifest, once Tier 1 ships. Suggested bound: **65536 events** — covers an accept-event cadence on the order of tens of thousands per day before eviction kicks in. Disk chain is unbounded as today.
-2. **`[handler.supervisor] record_child_events = false`** on sentinel's supervisor handler for frontdoor, once Tier 3 ships. Sentinel's interest in frontdoor is "did it crash", not "audit every TLS connection." Eliminates frontdoor's contribution to sentinel chain growth.
+The 2026-06-07 cutover stall flipped both of these. The amplification reproduced (so chain pragmatism now argues *for* per-conn, not against it), and the opt-in subscription work theater-dev is doing makes the per-conn spawn API a viable path without waiting on Tier 1 / Tier 3.
 
-Until Tier 1 lands, the v0 deploy carries the risk that high connection volume forces unbounded chain growth in frontdoor's in-memory Vec. Mitigation: watchdog auto-restart on frontdoor's RSS (same shape as the sentinel watchdog), as a temporary stopgap. The watchdog is operationally cheap because frontdoor's restart cost is "drop in-flight TLS connections, clients retry."
+#### 6.b.i Singleton chain-bounding configuration (if ever revived)
 
-**Status (2026-05-31):** Colin has asked theater to hold Tier 1/2/3 until a clean repro of the wedge is in hand. The frontdoor v0 design above is _conditional on those fixes eventually landing_ — interim deploy uses watchdog stopgap. If repro changes the root-cause picture, the singleton-vs-per-connection decision may swing back, but neither direction blocks shipping v0 today.
+1. `chain.in_memory_max_events` on frontdoor's manifest, once Tier 1 ships. Suggested bound: 65536 events. Disk chain unbounded as today.
+2. `[handler.supervisor] record_child_events = false` on sentinel's supervisor handler for frontdoor, once Tier 3 ships.
+
+Both are in theater-dev's plan but were blocked on Colin's "repro first" call at v0 design time. (Repro happened 2026-06-07; the response is the §6 pivot, not a singleton patch.)
+
+### 6.c Theater-dev API requirement — opt-in subscription on `supervisor.spawn`
+
+The per-conn child model assumes a `supervisor.spawn` API that lets the parent opt out of subscribing to the child's chain events. Theater-dev is designing this now; frontdoor is the highest-volume use case for it.
+
+**What frontdoor needs:**
+
+1. **Spawn-without-subscribe (deliver-level opt-out).** The acceptor calls `supervisor.spawn(per-conn-manifest, init_state, { subscribe: false })` (or equivalent — exact API shape TBD with theater-dev). Result: parent never receives `handle-child-event` callbacks for that child's chain events.
+
+2. **No parent-side recording of the (non-existent) deliveries.** Because no `handle-child-event` is delivered, the parent's chain has no `wasm-call("handle-child-event", ...)` entries to record. The amplification (which is a *recording* effect on the parent's chain) is gone by construction. *Confirm this falls out naturally — frontdoor doesn't need a separate `record_child_events = false` knob if `subscribe: false` already implies no delivery.*
+
+3. **Parent still gets `on-child-exit` (or equivalent supervisor lifecycle event).** The acceptor needs to know when a child exits, for the `children: Set<actor_id>` accounting + log line. This is **one** event per child lifetime, not per-event-on-child-chain — small, bounded. If the spawn opt-out also suppresses lifecycle events, that's a problem; frontdoor needs the exit hook.
+
+4. **`transfer(conn, child)` works against a freshly-spawned child.** Acceptor needs to hand the just-accepted connection to the just-spawned child. From §3.0 this primitive exists already; what the v1 design needs to confirm is that the target child receives the connection in `handle-connection` (or via some other entrypoint) *after* its `init` completes, not racing with it.
+
+5. **Per-conn-child chain disk write — is it bounded?** Theater's `ChainWriter` streams each actor's chain to `chains/{actor_id}.chain`. With per-accept-spawn, each TCP connection produces one chain file. Over time these accumulate on disk. **Question for theater-dev:** does theater GC per-actor chain files when the actor exits, or do they pile up forever? If they pile up, frontdoor adds a per-deploy housekeeping step; not blocking the design, but worth a yes/no.
+
+**Questions to theater-dev (PR review will pick this up):**
+
+- (a) API shape: an extra arg on `supervisor.spawn` vs. a new `spawn-detached` variant — preference?
+- (b) Does `subscribe: false` (or whatever it's called) cleanly avoid the recording amplification, or is a separate `record_child_events = false` still needed on the supervisor handler?
+- (c) Confirm `on-child-exit` (or equivalent) still fires even when chain-event subscription is disabled.
+- (d) `transfer(conn, child)` post-spawn timing — what's the entrypoint the child sees, and is there a race vs. `init`?
+- (e) Per-actor chain file lifecycle on disk — exit-cleanup, retention, or operator's job?
+
+None of these block opening the per-conn-child PR; the spawn-API question is the only one that gates the implementation, and theater-dev's opt-in-subscription work is in flight.
 
 ## 7. ACME / cert provisioning
 
@@ -258,18 +340,29 @@ This is the same shape as the recent "put inbox under sentinel" cutover ([[proje
 
 ## 9. Actor decomposition & build
 
-- One Rust crate `frontdoor` building one wasm component. One entrypoint (no spawn-arg branching). Singleton actor per §6.
-- One sentinel-rendered manifest `frontdoor.manifest.toml` consumed by sentinel-acceptor as a sibling actor.
-- `flake.nix` building the wasm via `nix build`, matching the pattern used by inbox-acceptor / tickets-acceptor flakes.
-- Dependencies: `packr-guest` only (per [[inbox-deps-no-theater-crate]] — guests don't depend on the `theater` crate; the host is host-side).
-- SNI parsing: hand-rolled (~100 LOC for the extension walk) to avoid pulling rustls's full ClientHello parser + transitive crypto code into a connection that never decrypts. Theater-dev confirmed rustls has a standalone ClientHello parser available, but the dependency cost isn't worth it for ~100 LOC of well-trodden TLS record parsing.
-- No `serde_json` or heavy JSON parsing if we can avoid it — the routing-table TOML can be parsed with `toml` (small), and the live-update command channel (§4.b) uses a minimal hand-rolled JSON parser. Will measure before deciding if `serde_json` is acceptable.
+v1 splits the Rust workspace into **two crates** producing **two wasm components**:
+
+- `frontdoor-acceptor` — the singleton. Owns both listeners, the route table, the control channel, and the supervisor of per-conn children. No `tcp_connect`, no SNI parsing, no on-data forwarding — these all moved to the child.
+- `frontdoor-conn` — the per-connection child. One instance per accepted public TCP connection. Receives the transferred conn + route snapshot via `init_state`, does SNI peek, backend connect, bidirectional bridge, exit. No listener, no control channel, no route mutation.
+
+Each crate's `lib.rs` ABI is small and disjoint: the acceptor exports `init`, `tcp-client.handle-connection` (control listener accepts only), `tcp-client.on-data` (control bytes), `tcp-client.on-close` (control), `supervisor.on-child-exit` (per-conn child lifecycle). The per-conn child exports `init` + the three `tcp-client.*` callbacks.
+
+Two manifests:
+
+- `frontdoor-acceptor.manifest.toml` — sentinel-rendered, consumed by sentinel as a sibling actor.
+- `frontdoor-conn.manifest.toml` — referenced from `frontdoor-acceptor.manifest.toml` via theater's `package = "https://..."` mechanism (per [[sentinel-phase2-scope]]). The acceptor passes the per-conn-child manifest URL through to `supervisor.spawn` calls. No separate sentinel renderable for the child — its config comes from `init_state` per spawn.
+
+`flake.nix` builds both wasm components in one invocation. Release artifacts: `frontdoor_acceptor-<tag>.wasm` + `frontdoor_conn-<tag>.wasm` alongside the existing `frontdoor.template.toml` (renamed `frontdoor-acceptor.template.toml`).
+
+- Dependencies on both crates: `packr-guest` only (per [[inbox-deps-no-theater-crate]] — guests don't depend on the `theater` crate; the host is host-side).
+- SNI parsing now lives in `frontdoor-conn`. Same hand-rolled parser (~100 LOC); can be moved into a tiny shared crate if it grows, but for v1 a cut-and-pasted module is fine.
+- `serde_json` stays on the acceptor for the control channel; the per-conn child only sees raw TLS bytes — no JSON parsing.
 
 Build + deploy:
 
-- Repo: `colinrozzi/frontdoor`. PRs via auto-merge squash; this repo has `allow_auto_merge=true` (verify on PR #1, follow [[feedback-gh-auto-merge-silent-noop]] if not).
-- Release: nix-build → wasm artifact published as GitHub release (or fetched directly from the repo via theater's `https://` manifest support, per [[sentinel-phase2-scope]]).
-- Sentinel renders the live manifest with route-table initial state, and brings frontdoor up as a managed sibling.
+- Repo: `colinrozzi/frontdoor`. PRs via auto-merge squash per [[feedback_mvp_velocity_auto_merge]].
+- Release: nix-build → both wasm artifacts published as a GitHub release; sentinel pins the acceptor URL and the acceptor passes the conn URL into spawns.
+- Sentinel renders the acceptor manifest with route-table initial state, and brings frontdoor-acceptor up as a managed sibling. Per-conn children are spawned by the acceptor, not sentinel — sentinel only sees the acceptor's chain.
 
 ## 10. Scope cuts (what we are NOT building in v0)
 
@@ -282,24 +375,24 @@ Build + deploy:
 - No structured access logging beyond Theater's actor-level event log. (Hostname + backend_addr for each connection is plenty for v0.)
 - No metrics emission. (Add a `theater:simple/metrics` integration in v1 once it exists.)
 
-## 11. Open follow-ups (post-v0)
+## 11. Open follow-ups (post-v1)
 
-- **`splice(in, out)` host primitive** — bidirectional host-side byte pump, no wasm round-trips per chunk. Theater-dev estimates ~150 LOC in `theater-handler-tcp` + new function in `tcp.pact`. Big perf win for a router under load; ship v0 first, profile, add splice if host↔wasm crossings show up as the bottleneck.
-- **Per-connection child actor refactor** — once Tier 1 chain-eviction + Tier 3 `record_child_events = false` ship, refactor singleton → per-connection child via `transfer(conn, child)`. Gains isolation (a bug in one connection can't corrupt the singleton's pipes table). §6 documents the criteria.
+- **`splice(in, out)` host primitive** — bidirectional host-side byte pump, no wasm round-trips per chunk. Theater-dev estimates ~150 LOC in `theater-handler-tcp` + new function in `tcp.pact`. Bigger win under v1 (per-conn-child does the forwarding) than it would have been under v0 — each child still pays the host↔wasm crossing per chunk today. Ship v1 first, profile, add splice if crossings show up as the bottleneck.
+- **Per-conn child chain GC.** If theater doesn't GC per-actor chain files on disk when actors exit (§6.c.5), frontdoor on a busy VPS could fill the chains directory. Operator-side cron sweep or a theater-side fix — defer until measured.
 - **Half-close primitive (`shutdown-write(conn)`)** — only if a routed protocol surfaces a need. Current API closes both directions, which is fine for TLS-encrypted streams.
 - Wildcard SNI routes.
 - Active backend health checks + fast-fail.
 - `:80` listener for ACME HTTP-01 dispatching, possibly enabling centralized cert provisioning.
 - TLS-termination mode for backends that don't want their own cert juggling.
-- Per-connection rate limiting / abuse defense.
-- Structured access logging (per-connection record into Theater event store).
+- Per-connection rate limiting / abuse defense (route-table-side: cap concurrent children per source IP).
+- Structured access logging — the acceptor records each spawn + exit; if we want headers / SNI / backend / bytes-transferred captured, the per-conn child needs an exit-time log emit. Simple add.
 
 ## 12. Risks
 
-- **Chain-growth wedge.** Until theater Tier 1 chain-eviction ships, an attacker who can open many TLS connections forces unbounded chain growth in frontdoor's in-memory Vec. Mitigation: watchdog auto-restart on RSS as an interim stopgap (§6.a.ii). The wedge is gated on Colin's "repro first" call; if repro changes the picture, §6.a may need revisiting, but the v0 design (singleton + watchdog) ships either way.
-- **Cutover from `inbox-acceptor` owning `:443`.** The swap drops in-flight TLS connections at the moment inbox-acceptor unbinds. Mitigation: schedule during low-traffic window, coordinate with inbox-dev and sentinel-dev. Not driving that coord now — design ships first.
-- **Adversarial ClientHellos** (intentionally fragmented, oversized, malformed) could DoS the SNI-parsing path. Mitigation: bound buffer size + read-count, close on parse failure, log + move on (§3.a).
-- **Singleton blast radius.** A bug in the SNI parser or pipe state machine takes down all in-flight connections, not just one. Mitigation: per-connection child actor refactor in v1 once Tier 1 + Tier 3 land (§11). Until then, the trade is "smaller v0 surface + bounded chain" vs "isolation."
-- **`HashMap` lookup cost per `on-data` callback.** Constant-factor; not a v0 concern. If host↔wasm crossings dominate before this does, we'll have switched to `splice()` anyway (§11).
+- **Spawn-rate ceiling.** Per-conn-child model spawns one wasm actor instance per accepted TCP connection. If accept rate is high (a scanner storm of 1000+ conn/sec), actor spawn becomes the hot path. Theater's actor spawn cost is ~ms order today (manifest fetch is cached after the first spawn; wasm instantiation is the dominant cost). Mitigation if it bites: cap accept rate at the acceptor (don't `accept` faster than a configured threshold), or batch-spawn pre-warmed children. Defer until measured under real traffic.
+- **Cutover from `inbox-acceptor` owning `:443`.** The swap drops in-flight TLS connections at the moment inbox-acceptor unbinds. Mitigation: schedule during low-traffic window, coordinate with inbox-dev and sentinel-dev. Cutover proper is already gated on this redesign per manager id=38.
+- **Adversarial ClientHellos** (intentionally fragmented, oversized, malformed) could DoS the SNI-parsing path on the per-conn child. The blast radius shrinks dramatically vs. v0 — only that child crashes, not the acceptor. Mitigation: bound buffer size + read-count, close on parse failure, log + exit (§3.a).
+- **Per-conn child chain files on disk** — see §6.c.5. Unbounded accumulation if theater doesn't GC. Operator-side cron sweep is a stopgap; flag for theater-dev follow-up.
+- **Opt-in subscription API not yet shipped.** v1 implementation blocked on theater-dev's spawn-without-subscribe API (§6.c). Mitigation: implementation can scaffold against a placeholder API and adapt to the final shape during PR review. The architectural shape (two crates, transfer-on-accept, route snapshot) is independent of the exact spawn-API call site.
 
 — end —
