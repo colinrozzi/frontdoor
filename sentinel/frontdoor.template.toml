@@ -30,14 +30,27 @@
 #                       lacks a matching route — or has no SNI — to be
 #                       dropped.
 #
-# All `"` inside `__FRONTDOOR_CFG__` must be TOML-escaped (`\"`) by
-# sentinel's substitution path before the rendered TOML is handed to
-# theater. inbox-acceptor's template already does this for its
-# `__BEARER_TOKEN__` / `__DKIM_PRIVATE_KEY__` slots; same shape.
+# `initial_state` is wrapped in a TOML SINGLE-QUOTE literal (`'...'`),
+# NOT double-quote. `__FRONTDOOR_CFG__` is a JSON object full of double
+# quotes; sentinel substitutes it verbatim, so a double-quoted wrapper
+# (`"__FRONTDOOR_CFG__"`) would have its first inner `"` close the string
+# → invalid TOML. A single-quote literal preserves the JSON's double
+# quotes with ZERO escaping. This is exactly how inbox-acceptor's and the
+# UI acceptors' templates wrap their JSON initial_state — match them; do
+# NOT reintroduce escaping (that nested-escape trap broke the 2026-05-31
+# cutover). Safe because a routing-config JSON contains no single quotes.
 
 name = "frontdoor"
 version = "0.1.0"
 package = "__PACKAGE__"
+
+# MUST sit at the actor root, ABOVE the [[handler]] array-of-tables. A
+# bare key placed after any [[handler]] block binds to that handler table
+# (TOML array-of-tables scoping), not the actor root, so frontdoor would
+# spawn with no config and fall back to its hardcoded defaults
+# (0.0.0.0:443 / 127.0.0.1:9100, no routes). Keep it here, matching the
+# inbox-acceptor / UI-acceptor templates.
+initial_state = '__FRONTDOOR_CFG__'
 
 [[handler]]
 type = "runtime"
@@ -50,5 +63,3 @@ type = "tcp"
 # wired for chain bookkeeping with sentinel.
 [[handler]]
 type = "supervisor"
-
-initial_state = "__FRONTDOOR_CFG__"
