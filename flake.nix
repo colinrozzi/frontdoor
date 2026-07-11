@@ -39,16 +39,36 @@
             (type == "directory");
         };
 
+        # PIC side-module link flags (packr 0.8.x recipe). These MUST reach
+        # the real cargo invocation. crane does NOT honor the repo
+        # .cargo/config.toml (kept in-tree for devshell / plain-cargo builds),
+        # so pass them via CARGO_ENCODED_RUSTFLAGS — highest cargo precedence,
+        # cannot be shadowed by config. Flags are joined by 0x1f (ASCII unit
+        # separator), cargo's encoded-rustflags delimiter.
+        picSep = builtins.fromJSON "\"\\u001f\"";
+        picRustflags = builtins.concatStringsSep picSep [
+          "-C" "relocation-model=pic"
+          "-C" "link-arg=--experimental-pic"
+          "-C" "link-arg=-shared"
+          "-C" "link-arg=--import-memory"
+          "-C" "link-arg=--export=__wasm_call_ctors"
+        ];
+
         commonArgs = {
           inherit src;
           pname = "frontdoor";
           version = "0.1.0";
           cargoExtraArgs = "--target wasm32-unknown-unknown";
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+          CARGO_ENCODED_RUSTFLAGS = picRustflags;
           doCheck = false;
         };
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        # No buildDepsOnly: with the PIC link flags, crane's synthetic
+        # deps-only dummy crate fails to link (-shared needs __heap_base/
+        # __data_end, which only the real crates get from packr-guest's
+        # `pic` feature). Build everything in one buildPackage pass instead.
+        cargoArtifacts = null;
 
         theaterBin = theater.packages.${system}.default;
 
