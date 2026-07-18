@@ -14,17 +14,37 @@ env:
 
 jobs:
   build:
-    name: nix build
+    name: build composite + verify self-contained
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build wasm
-        run: nix build
-
-      - name: Verify wasm artifact
+      # packr 0.10.2: cargo-builds the fixed-base member (.cargo/config.toml),
+      # links it with the packr bundled allocator, verifies host-only imports,
+      # and emits target/wasm32-unknown-unknown/release/frontdoor.composite.wasm.
+      - name: theater build --release (compose + verify-in-build)
         run: |
-          test -f result/frontdoor.wasm
-          ls -la result/
+          set -euo pipefail
+          echo "::group::theater build ."
+          nix develop --command theater build --release .
+          echo "::endgroup::"
+
+      # Independent belt-and-suspenders assert on top of theater build's own
+      # verify: composite validates and every RESIDUAL import is a host
+      # theater:simple/* func (no env.memory / pack:alloc / __linear_memory).
+      - name: Assert composite is self-contained (host-only imports)
+        run: |
+          set -euo pipefail
+          C="target/wasm32-unknown-unknown/release/frontdoor.composite.wasm"
+          test -f "$C" || { echo "::error::composite not emitted: $C"; exit 1; }
+          nix develop --command wasm-tools validate "$C"
+          bad=$(nix develop --command bash -c "wasm-tools print '$C' | grep -E '^[[:space:]]*\\(import ' | grep -v 'theater:simple/' || true")
+          if [ -n "$bad" ]; then
+            echo "::error::frontdoor composite has non-host imports (not self-contained):"
+            echo "$bad"
+            exit 1
+          fi
+          echo "frontdoor composite self-contained: $C ($(stat -c%s "$C") bytes)"
