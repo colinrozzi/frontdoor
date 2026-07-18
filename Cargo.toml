@@ -7,18 +7,15 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.8.1", features = ["derive", "pic"] }
+# packr 0.10.2 self-contained model (PIC retired). Keep `derive` — frontdoor's
+# routing state uses #[derive(Clone, GraphValue)] (src/lib.rs). The fixed-base
+# link recipe lives in .cargo/config.toml; `theater build` fuses this member
+# with the packr bundled allocator into frontdoor.composite.wasm. See theater
+# docs/self-contained-actor-recipe.md.
+packr-guest = { version = "0.10.2", features = ["derive"] }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
 [profile.release]
 opt-level = "s"
-# LTO MUST stay ON for the PIC (packr-guest `pic` feature) build. Under the
-# `-shared` PIC link, fat LTO recompiles the precompiled `core`/`alloc`
-# bitcode as position-independent; WITHOUT it, lld links the non-PIC sysroot
-# `liballoc` object as-is and aborts with `relocation R_WASM_* ... recompile
-# with -fPIC`. (The `__heap_base`/`__data_end` placeholders come from
-# packr-guest's `pic` feature and survive here; the earlier "not found"
-# failure was crane's synthetic deps-only crate lacking packr-guest — fixed
-# in flake.nix by dropping buildDepsOnly.) Matches inbox-ui / mesh. Keep true.
 lto = true
