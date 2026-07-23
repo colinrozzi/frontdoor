@@ -14,7 +14,7 @@ env:
 
 jobs:
   build:
-    name: build composite + verify self-contained
+    name: build plain wasm + verify host-only imports
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,29 +22,29 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      # packr 0.10.2: cargo-builds the fixed-base member (.cargo/config.toml),
-      # links it with the packr bundled allocator, verifies host-only imports,
-      # and emits target/wasm32-unknown-unknown/release/frontdoor.composite.wasm.
-      - name: theater build --release (compose + verify-in-build)
+      # packr 0.11.0 plain build: the two link-args come from .cargo/config.toml
+      # (--export-memory, --no-entry). The resulting frontdoor.wasm is directly
+      # loadable — no compose step, no binaryen.
+      - name: cargo build --release (plain cdylib)
         run: |
           set -euo pipefail
-          echo "::group::theater build ."
-          nix develop --command theater build --release .
+          echo "::group::cargo build"
+          nix develop --command cargo build --target wasm32-unknown-unknown --release
           echo "::endgroup::"
 
-      # Independent belt-and-suspenders assert on top of theater build's own
-      # verify: composite validates and every RESIDUAL import is a host
-      # theater:simple/* func (no env.memory / pack:alloc / __linear_memory).
-      - name: Assert composite is self-contained (host-only imports)
+      # Verify the plain wasm is self-contained: it validates and every import is
+      # a host theater:simple/* func (no env.memory / pack:alloc / __linear_memory
+      # — those would mean the recipe was not applied).
+      - name: Assert host-only imports
         run: |
           set -euo pipefail
-          C="target/wasm32-unknown-unknown/release/frontdoor.composite.wasm"
-          test -f "$C" || { echo "::error::composite not emitted: $C"; exit 1; }
-          nix develop --command wasm-tools validate "$C"
-          bad=$(nix develop --command bash -c "wasm-tools print '$C' | grep -E '^[[:space:]]*\\(import ' | grep -v 'theater:simple/' || true")
+          W="target/wasm32-unknown-unknown/release/frontdoor.wasm"
+          test -f "$W" || { echo "::error::wasm not emitted: $W"; exit 1; }
+          nix develop --command wasm-tools validate "$W"
+          bad=$(nix develop --command bash -c "wasm-tools print '$W' | grep -E '^[[:space:]]*\\(import ' | grep -v 'theater:simple/' || true")
           if [ -n "$bad" ]; then
-            echo "::error::frontdoor composite has non-host imports (not self-contained):"
+            echo "::error::frontdoor.wasm has non-host imports (recipe not applied):"
             echo "$bad"
             exit 1
           fi
-          echo "frontdoor composite self-contained: $C ($(stat -c%s "$C") bytes)"
+          echo "frontdoor.wasm host-only imports OK: $W ($(stat -c%s "$W") bytes)"

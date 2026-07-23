@@ -7,12 +7,12 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-# packr 0.10.2 self-contained model (PIC retired). Keep `derive` — frontdoor's
-# routing state uses #[derive(Clone, GraphValue)] (src/lib.rs). The fixed-base
-# link recipe lives in .cargo/config.toml; `theater build` fuses this member
-# with the packr bundled allocator into frontdoor.composite.wasm. See theater
-# docs/self-contained-actor-recipe.md.
-packr-guest = { version = "0.10.2", features = ["derive"] }
+# packr 0.11.0 plain-build model (composition retired). Keep `derive` —
+# frontdoor's routing state uses #[derive(Clone, GraphValue)] (src/lib.rs); that
+# alone is the migration, no source rewrite. setup_guest!() links dlmalloc in
+# and the cdylib is directly loadable — no compose step. The two link-args live
+# in .cargo/config.toml. See theater docs/self-contained-actor-recipe.md.
+packr-guest = { version = "0.11.0", features = ["derive"] }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 

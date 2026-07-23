@@ -1,19 +1,11 @@
 [target.wasm32-unknown-unknown]
-# Fixed-base self-contained member (packr 0.10.2). Replaces the retired PIC
-# flags entirely (no relocation-model=pic / --experimental-pic / -shared /
-# --export=__wasm_call_ctors). `theater build` links this member + the packr
-# bundled allocator into an own-memory frontdoor.composite.wasm via packr::link
-# (wasm-merge). --global-base=0x50000 (327680) is the first package slot for a
-# SINGLE-package actor (frontdoor is one crate — no [[link]] edges).
-# --no-merge-data-segments keeps the CGRF __pack_types metadata as its own
-# segment so packr's read_surface can find it. See theater
-# docs/self-contained-actor-recipe.md §2.
+# packr 0.11.0 plain-build model (composition/fuse retired). The actor is a
+# plain cdylib: `packr-guest`'s setup_guest!() links dlmalloc in and the wasm
+# exports its own GROWABLE memory + __pack_alloc/__pack_free + lifecycle,
+# importing only host theater:simple/*. No fixed base, no --import-memory, no
+# compose step. Just: export the memory + no CRT entry point. See theater
+# docs/self-contained-actor-recipe.md (top block).
 rustflags = [
-    "-C", "link-arg=--import-memory",
-    "-C", "link-arg=--initial-memory=8388608",
-    "-C", "link-arg=--stack-first",
-    "-C", "link-arg=-zstack-size=262144",
-    "-C", "link-arg=--global-base=327680",
+    "-C", "link-arg=--export-memory",
     "-C", "link-arg=--no-entry",
-    "-C", "link-arg=--no-merge-data-segments",
 ]
