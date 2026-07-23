@@ -2,8 +2,8 @@ name: Release
 
 on:
   # Tag-driven release. Push a `release-*` tag (locally or via
-  # workflow_dispatch) to cut a versioned self-contained composite +
-  # sentinel-renderable manifest.
+  # workflow_dispatch) to cut a versioned plain wasm + sentinel-renderable
+  # manifest.
   push:
     tags: ['release-*']
   workflow_dispatch:
@@ -17,7 +17,7 @@ env:
 
 jobs:
   release:
-    name: Build composite + tag + upload artifacts
+    name: Build plain wasm + tag + upload artifacts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,28 +27,29 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      # packr 0.10.2 self-contained composite (compose + verify-in-build).
-      # Emits target/wasm32-unknown-unknown/release/frontdoor.composite.wasm.
-      - name: theater build --release (compose + verify-in-build)
+      # packr 0.11.0 plain build (two link-args from .cargo/config.toml).
+      # Emits target/wasm32-unknown-unknown/release/frontdoor.wasm — directly
+      # loadable, no compose step.
+      - name: cargo build --release (plain cdylib)
         run: |
           set -euo pipefail
-          echo "::group::theater build ."
-          nix develop --command theater build --release .
+          echo "::group::cargo build"
+          nix develop --command cargo build --target wasm32-unknown-unknown --release
           echo "::endgroup::"
 
-      - name: Assert composite is self-contained (host-only imports)
+      - name: Assert host-only imports
         run: |
           set -euo pipefail
-          C="target/wasm32-unknown-unknown/release/frontdoor.composite.wasm"
-          test -f "$C" || { echo "::error::composite not emitted: $C"; exit 1; }
-          nix develop --command wasm-tools validate "$C"
-          bad=$(nix develop --command bash -c "wasm-tools print '$C' | grep -E '^[[:space:]]*\\(import ' | grep -v 'theater:simple/' || true")
+          W="target/wasm32-unknown-unknown/release/frontdoor.wasm"
+          test -f "$W" || { echo "::error::wasm not emitted: $W"; exit 1; }
+          nix develop --command wasm-tools validate "$W"
+          bad=$(nix develop --command bash -c "wasm-tools print '$W' | grep -E '^[[:space:]]*\\(import ' | grep -v 'theater:simple/' || true")
           if [ -n "$bad" ]; then
-            echo "::error::frontdoor composite has non-host imports (not self-contained):"
+            echo "::error::frontdoor.wasm has non-host imports (recipe not applied):"
             echo "$bad"
             exit 1
           fi
-          echo "frontdoor composite self-contained: $C ($(stat -c%s "$C") bytes)"
+          echo "frontdoor.wasm host-only imports OK: $W ($(stat -c%s "$W") bytes)"
 
       - name: Create GitHub release and upload artifacts
         run: |
@@ -67,13 +68,13 @@ jobs:
           STAGE_TAG="${TAG#release-}"
           REPO="${{ github.repository }}"
 
-          # Deploy artifact = the self-contained COMPOSITE (a bare member is
-          # rejected by the 0.10.x loader). Stage-tagged for a stable URL.
-          COMPOSITE_FILE="frontdoor-${STAGE_TAG}.composite.wasm"
-          cp "target/wasm32-unknown-unknown/release/frontdoor.composite.wasm" "${COMPOSITE_FILE}"
-          chmod +w "${COMPOSITE_FILE}"
+          # Deploy artifact = the plain, directly-loadable wasm (packr 0.11.0 —
+          # no composite). Stage-tagged for a stable URL.
+          WASM_FILE="frontdoor-${STAGE_TAG}.wasm"
+          cp "target/wasm32-unknown-unknown/release/frontdoor.wasm" "${WASM_FILE}"
+          chmod +w "${WASM_FILE}"
 
-          COMPOSITE_URL="https://github.com/${REPO}/releases/download/${TAG}/${COMPOSITE_FILE}"
+          WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/${WASM_FILE}"
 
           # Direct-spawn manifest. Self-referencing `package` URL +
           # no `initial_state`. Use this with `theater spawn` from a
@@ -82,7 +83,7 @@ jobs:
           cat > "${MANIFEST_FILE}" <<TOML
           name = "frontdoor"
           version = "0.1.0"
-          package = "${COMPOSITE_URL}"
+          package = "${WASM_URL}"
 
           [[handler]]
           type = "runtime"
@@ -96,7 +97,7 @@ jobs:
 
           # Sentinel-renderable variant: __PACKAGE__ + __FRONTDOOR_CFG__
           # placeholders for sentinel's substitution path. Sentinel pins
-          # the composite via `children.frontdoor.default_package` and renders
+          # the wasm via `children.frontdoor.default_package` and renders
           # `initial_state` from `secrets.FRONTDOOR_CFG`. Kept in sync
           # with sentinel/frontdoor.template.toml at HEAD by copying it
           # into the release verbatim.
@@ -104,11 +105,11 @@ jobs:
           cp sentinel/frontdoor.template.toml "${SENTINEL_TEMPLATE_FILE}"
           chmod +w "${SENTINEL_TEMPLATE_FILE}"
 
-          gh release upload "$TAG" "${COMPOSITE_FILE}" "${MANIFEST_FILE}" "${SENTINEL_TEMPLATE_FILE}"
+          gh release upload "$TAG" "${WASM_FILE}" "${MANIFEST_FILE}" "${SENTINEL_TEMPLATE_FILE}"
 
           echo "Released $TAG:"
-          echo "  composite: ${COMPOSITE_FILE}"
-          echo "  manifest:  ${MANIFEST_FILE}"
-          echo "  sentinel:  ${SENTINEL_TEMPLATE_FILE}"
+          echo "  wasm:     ${WASM_FILE}"
+          echo "  manifest: ${MANIFEST_FILE}"
+          echo "  sentinel: ${SENTINEL_TEMPLATE_FILE}"
         env:
           GH_TOKEN: ${{ github.token }}

@@ -7,11 +7,10 @@
 
 name = "frontdoor"
 version = "0.1.0"
-# packr 0.10.2 self-contained composite (the deployable artifact — a bare
-# member is rejected by the 0.10.x loader). `theater build --release .`
-# rewrites this `package` to the built composite path; kept here for a local
+# packr 0.11.0 plain wasm — the deployable artifact is the directly-loadable
+# cdylib (no composite). Path to the local `cargo build` output; kept for a
 # `theater spawn manifest.toml` smoke.
-package = "target/wasm32-unknown-unknown/release/frontdoor.composite.wasm"
+package = "target/wasm32-unknown-unknown/release/frontdoor.wasm"
 
 [[handler]]
 type = "runtime"
