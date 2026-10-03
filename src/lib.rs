@@ -253,21 +253,13 @@ fn on_data(
 ) -> Result<(FrontdoorState, ()), String> {
     let mut state = state;
 
-    // An empty-bytes callback IS the EOF signal: the peer closed (or
-    // half-closed its write side — the TCP API doesn't distinguish, and
-    // frontdoor only routes TLS so a full teardown is correct; DESIGN.md
-    // §3.3). The active-mode runtime signals peer-FIN this way and does NOT
-    // also fire on-close for it, so if we don't tear down here the local
-    // socket lingers in CLOSE-WAIT and leaks its FD until EMFILE wedges the
-    // listener — prod incident 2026-10-03 (925 FIN-WAIT-2 + 125 CLOSE-WAIT
-    // on :443). The old code forwarded this as a zero-byte tcp_send to the
-    // peer — a no-op that closed nothing. Teardown is idempotent, so a
-    // later on-close (if one does arrive) is harmless.
+    // Defensive only: the active-mode runtime never delivers an empty
+    // on-data — n==0 is the EOF arm and is surfaced as on-close("eof"), so
+    // any real payload here is >= 1 byte (confirmed against
+    // theater-handler-tcp::tcp_read_loop). Tearing down on an empty payload
+    // is harmless (teardown is idempotent) and guards a future contract
+    // change; it is NOT the EOF path — that lives in on-close.
     if data.is_empty() {
-        log(format!(
-            "[frontdoor] on-data {} empty (peer EOF); tearing down",
-            conn_id
-        ));
         teardown(&mut state, &conn_id);
         return Ok((state, ()));
     }
@@ -275,8 +267,7 @@ fn on_data(
     if let Some(idx) = find_pending(&state.pending, &conn_id) {
         handle_pending_data(&mut state, idx, data);
     } else if let Some(peer) = find_peer(&state.pipes, &conn_id) {
-        // Mid-stream bytes; forward to peer. (EOF is handled above as an
-        // empty callback, so any payload here is real bytes.)
+        // Mid-stream bytes; forward to peer.
         if let Err(e) = tcp_send(peer.clone(), data) {
             log(format!(
                 "[frontdoor] forward send {} -> {} failed: {}; tearing down pipe",

@@ -74,9 +74,10 @@ Both options cross host↔wasm twice per chunk and are functional for v0. Splice
 
 ### 3.3 Close semantics
 
-- **EOF detection:** `receive()` returning an empty list (or active-mode `on-data` callback firing with empty bytes) is the signal the peer closed (or half-closed write side; the API doesn't distinguish).
-- **Action on EOF from one side:** send any remaining buffered bytes on the peer, then `close(peer)`. Free the `HashMap` entry.
-- **No half-close primitive.** `close(conn)` terminates both directions. For TLS-encrypted streams this is fine — the application protocol inside TLS handles its own connection framing, and TLS `close_notify` is the backend's concern (frontdoor never sees decrypted bytes). For raw protocols that depend on half-close, the current API can't express it; not a v0 problem (we only route TLS streams).
+- **EOF detection (active mode):** peer-FIN/EOF is delivered as a **`tcp-client.on-close` callback** with `reason = "eof"` — NOT as an empty-bytes `on-data`. In active mode `on-data` only ever fires with ≥1 byte (verified against `theater-handler-tcp::tcp_read_loop`: the `Ok(0)` read arm fires `on-close`, the `Ok(n>=1)` arm fires `on-data`). Other `on-close` reasons: `"idle"` (idle-timeout elapsed) and a read-error string. (On our own actor shutdown the read loop is cancelled WITHOUT an `on-close`, so teardown must not depend on `on-close` during our stop.)
+- **Action on EOF from one side:** in `on-close`, `close()` the **paired** connection too and free both `pipes` entries. This cross-close is what prevents the leak: `CLOSE-WAIT`/`FIN-WAIT-2` accumulate when we receive one leg's FIN but never close the other leg.
+- **`close(conn)` is `shutdown(WRITE)`, and does NOT cancel the active read loop.** It flushes our FIN / TLS `close_notify` on the write half and removes the map entry, but the read half lives in the read loop, which keeps running — and keeps the FD pinned — until the peer FINs, errors, or the **idle-timeout** fires. Consequence: after we `close()` a leg, a later peer-FIN on that same conn delivers ONE MORE `on-close("eof")` for the (now stateless) id → teardown must be **idempotent**. And a gone/silent peer (dropped mobile, scanner) that never FINs back will pin the read-half FD indefinitely unless the listener has an **idle-timeout** configured — so one is required for the public `:443` listener.
+- **No half-close primitive.** We always tear down both directions on EOF. For TLS-encrypted streams this is fine — the application protocol inside TLS handles its own connection framing, and TLS `close_notify` is the backend's concern (frontdoor never sees decrypted bytes). For raw protocols that depend on half-close, the current API can't express it; not a v0 problem (we only route TLS streams).
 - **Backend connect failure:** drop the client immediately with `close(inbound)`. No retry, no buffering (see §5).
 
 ### 3.a SNI parse (in-actor)
@@ -131,12 +132,19 @@ listener-actor (singleton; supervises nothing)
       pipes[inbound] = outbound; pipes[outbound] = inbound
       del pending[conn]
     else if conn in pipes:
-      if bytes.empty:                      // EOF
+      send(pipes[conn], bytes)             // bytes is always >= 1 byte in active mode
+
+  on tcp-client.on-close(conn, reason):    // reason: "eof" | "idle" | <error>
+    teardown(conn)                         // phase-aware + idempotent:
+      if conn in pending: close(conn); del pending[conn]
+      else if conn in pipes:               // cross-close the paired leg
         peer = pipes[conn]; close(conn); close(peer)
         del pipes[conn]; del pipes[peer]
-      else:
-        send(pipes[conn], bytes)
+      else: close(conn)                    // trailing on-close after our own close() — no-op
 ```
+
+> Listener must be created with an **idle-timeout** so a half-closed-but-silent
+> peer can't pin the lingering read-half FD (see §3.3).
 
 ## 4. Routing table
 
