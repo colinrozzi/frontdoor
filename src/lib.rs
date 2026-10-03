@@ -252,12 +252,31 @@ fn on_data(
     data: Vec<u8>,
 ) -> Result<(FrontdoorState, ()), String> {
     let mut state = state;
+
+    // An empty-bytes callback IS the EOF signal: the peer closed (or
+    // half-closed its write side — the TCP API doesn't distinguish, and
+    // frontdoor only routes TLS so a full teardown is correct; DESIGN.md
+    // §3.3). The active-mode runtime signals peer-FIN this way and does NOT
+    // also fire on-close for it, so if we don't tear down here the local
+    // socket lingers in CLOSE-WAIT and leaks its FD until EMFILE wedges the
+    // listener — prod incident 2026-10-03 (925 FIN-WAIT-2 + 125 CLOSE-WAIT
+    // on :443). The old code forwarded this as a zero-byte tcp_send to the
+    // peer — a no-op that closed nothing. Teardown is idempotent, so a
+    // later on-close (if one does arrive) is harmless.
+    if data.is_empty() {
+        log(format!(
+            "[frontdoor] on-data {} empty (peer EOF); tearing down",
+            conn_id
+        ));
+        teardown(&mut state, &conn_id);
+        return Ok((state, ()));
+    }
+
     if let Some(idx) = find_pending(&state.pending, &conn_id) {
         handle_pending_data(&mut state, idx, data);
     } else if let Some(peer) = find_peer(&state.pipes, &conn_id) {
-        // Mid-stream byte; forward to peer. EOF from the kernel is
-        // delivered via on-close, not an empty on-data, so any payload
-        // here is real bytes.
+        // Mid-stream bytes; forward to peer. (EOF is handled above as an
+        // empty callback, so any payload here is real bytes.)
         if let Err(e) = tcp_send(peer.clone(), data) {
             log(format!(
                 "[frontdoor] forward send {} -> {} failed: {}; tearing down pipe",
@@ -286,25 +305,33 @@ fn on_close(
 ) -> Result<(FrontdoorState, ()), String> {
     let mut state = state;
     log(format!("[frontdoor] on-close {} reason={}", conn_id, reason));
+    teardown(&mut state, &conn_id);
+    Ok((state, ()))
+}
 
+/// Close a connection and free its state, whatever phase it is in. Shared
+/// by the on-close callback and the empty-on-data (EOF) path in on-data, so
+/// both close signals fully tear down the socket AND its pipe peer. Fully
+/// idempotent: a conn with no state left just gets a best-effort close(), so
+/// calling this twice for one conn (e.g. empty-on-data then on-close) is safe.
+fn teardown(state: &mut FrontdoorState, conn_id: &str) {
     // Pending connection: drop the buffer + close the (possibly already
     // half-closed) socket. No outbound yet, so nothing else to tear down.
-    if let Some(idx) = find_pending(&state.pending, &conn_id) {
+    if let Some(idx) = find_pending(&state.pending, conn_id) {
         state.pending.swap_remove(idx);
-        let _ = tcp_close(conn_id);
-        return Ok((state, ()));
+        let _ = tcp_close(conn_id.to_string());
+        return;
     }
 
-    // Steady-state pipe: close the peer, drop both pipe entries. The
-    // already-closed side gets a redundant close() — harmless.
-    if find_peer(&state.pipes, &conn_id).is_some() {
-        close_pipe(&mut state, &conn_id);
-        return Ok((state, ()));
+    // Steady-state pipe: close this side AND the peer, drop both pipe
+    // entries. An already-closed side gets a redundant close() — harmless.
+    if find_peer(&state.pipes, conn_id).is_some() {
+        close_pipe(state, conn_id);
+        return;
     }
 
     // Unknown conn (likely already cleaned up). Make the close idempotent.
-    let _ = tcp_close(conn_id);
-    Ok((state, ()))
+    let _ = tcp_close(conn_id.to_string());
 }
 
 // ───────────────────── connection state machine ──────────────────────
