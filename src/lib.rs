@@ -39,6 +39,27 @@ const DEFAULT_CONTROL_LISTEN_ADDR: &str = "127.0.0.1:9100";
 /// this are dropped.
 const PENDING_BUFFER_CAP: usize = 8 * 1024;
 
+// ───────────────────────── idle reaping ──────────────────────────────
+//
+// close() is shutdown(WRITE) only and does NOT cancel the active read loop
+// (theater-handler-tcp), so a connection whose peer vanished without a FIN
+// (dropped mobile, scanner, backend gone) pins its read-half FD forever —
+// the prod incident 2026-10-03 FD-exhaustion (EMFILE on :443). We reap it
+// ourselves: one periodic `theater:simple/timer` sweeper advances a tick
+// counter; every connection stamps its `last_tick` on activity; the sweeper
+// closes anything idle past its budget. Pair-level (either leg's bytes bump
+// the pipe), so an actively-streaming one-directional transfer is never cut.
+// Tick-counting instead of a wall clock keeps it replay-deterministic.
+const IDLE_SWEEP_TIMER: &str = "idle-sweep";
+const SWEEP_INTERVAL_MS: u64 = 10_000; // 10s between sweeps
+
+/// Pipe idle budget: both directions silent this many sweeps ⇒ dead/half-open
+/// ⇒ reap. ~5 min. Streams bump `last_tick`, so only truly-silent pipes hit it.
+const IDLE_PIPE_TICKS: u64 = 30;
+/// Pending idle budget: connected but no classifiable request within ~60s ⇒
+/// abandoned / slow-loris ⇒ reap. (Long-lived `control` conns are exempt.)
+const IDLE_PENDING_TICKS: u64 = 6;
+
 // ───────────────────────────── state ─────────────────────────────────
 
 #[derive(Clone, GraphValue)]
@@ -58,6 +79,10 @@ pub struct Pending {
     pub conn_id: String,
     pub kind: String,
     pub buf: Vec<u8>,
+    /// Sweep tick at the last activity on this conn (set on accept, bumped on
+    /// each on-data). The idle sweeper reaps non-`control` pendings past
+    /// `IDLE_PENDING_TICKS`.
+    pub last_tick: u64,
 }
 
 #[derive(Clone, GraphValue)]
@@ -65,6 +90,9 @@ pub struct Pending {
 pub struct Pipe {
     pub a: String,
     pub b: String,
+    /// Sweep tick at the last byte in EITHER direction. The idle sweeper reaps
+    /// pipes idle (both ways) past `IDLE_PIPE_TICKS`.
+    pub last_tick: u64,
 }
 
 #[derive(Clone, GraphValue)]
@@ -76,6 +104,9 @@ pub struct FrontdoorState {
     pub default_backend: String, // empty = no default
     pub pending: Vec<Pending>,
     pub pipes: Vec<Pipe>,
+    /// Monotonic sweep counter, advanced once per idle-sweep timer fire. Used
+    /// as a coarse replay-deterministic clock for idle reaping (no wall time).
+    pub tick: u64,
 }
 
 // ─────────────────────────── ABI surface ─────────────────────────────
@@ -93,12 +124,16 @@ pack_types! {
             send: func(connection-id: string, data: list<u8>) -> result<u64, string>,
             close: func(connection-id: string) -> result<_, string>,
         }
+        theater:simple/timer {
+            set-interval: func(name: string, interval-ms: u64) -> result<string, string>,
+        }
     }
     exports {
         theater:simple/actor.init: func(state: value) -> result<frontdoor-state, string>,
         theater:simple/tcp-client.handle-connection: func(state: frontdoor-state, connection-id: string) -> result<frontdoor-state, string>,
         theater:simple/tcp-client.on-data: func(state: frontdoor-state, connection-id: string, data: list<u8>) -> result<frontdoor-state, string>,
         theater:simple/tcp-client.on-close: func(state: frontdoor-state, connection-id: string, reason: string) -> result<frontdoor-state, string>,
+        theater:simple/timer.handle-tick: func(state: frontdoor-state, name: string) -> result<frontdoor-state, string>,
     }
 }
 
@@ -122,6 +157,9 @@ fn tcp_send(conn_id: String, data: Vec<u8>) -> Result<u64, String>;
 
 #[import(module = "theater:simple/tcp", name = "close")]
 fn tcp_close(conn_id: String) -> Result<(), String>;
+
+#[import(module = "theater:simple/timer", name = "set-interval")]
+fn timer_set_interval(name: String, interval_ms: u64) -> Result<String, String>;
 
 // ─────────────────────── initial-state schema ────────────────────────
 
@@ -200,6 +238,20 @@ fn init(state: Value) -> Result<(FrontdoorState, ()), String> {
         }
     ));
 
+    // Arm the single pair-idle sweeper (see the idle-reaping section + the
+    // handle-tick export). If it fails to arm we degrade to the old
+    // no-reaper behavior — a failure must not block routing, so log + carry on.
+    match timer_set_interval(String::from(IDLE_SWEEP_TIMER), SWEEP_INTERVAL_MS) {
+        Ok(_) => log(format!(
+            "[frontdoor] idle-sweep armed every {}ms (pipe budget {} ticks, pending {} ticks)",
+            SWEEP_INTERVAL_MS, IDLE_PIPE_TICKS, IDLE_PENDING_TICKS
+        )),
+        Err(e) => log(format!(
+            "[frontdoor] WARN: idle-sweep set-interval failed: {}; FD reaper DISABLED",
+            e
+        )),
+    }
+
     Ok((
         FrontdoorState {
             public_listener_id,
@@ -208,6 +260,7 @@ fn init(state: Value) -> Result<(FrontdoorState, ()), String> {
             default_backend,
             pending: Vec::new(),
             pipes: Vec::new(),
+            tick: 0,
         },
         (),
     ))
@@ -235,6 +288,7 @@ fn handle_connection(
         conn_id,
         kind: String::from("unknown"),
         buf: Vec::new(),
+        last_tick: state.tick,
     });
     Ok((state, ()))
 }
@@ -267,13 +321,17 @@ fn on_data(
     if let Some(idx) = find_pending(&state.pending, &conn_id) {
         handle_pending_data(&mut state, idx, data);
     } else if let Some(peer) = find_peer(&state.pipes, &conn_id) {
-        // Mid-stream bytes; forward to peer.
-        if let Err(e) = tcp_send(peer.clone(), data) {
-            log(format!(
-                "[frontdoor] forward send {} -> {} failed: {}; tearing down pipe",
-                conn_id, peer, e
-            ));
-            close_pipe(&mut state, &conn_id);
+        // Mid-stream bytes; forward to peer and mark the pipe active so the
+        // idle sweeper leaves it alone (either leg's bytes count).
+        match tcp_send(peer.clone(), data) {
+            Ok(_) => touch_pipe(&mut state, &conn_id),
+            Err(e) => {
+                log(format!(
+                    "[frontdoor] forward send {} -> {} failed: {}; tearing down pipe",
+                    conn_id, peer, e
+                ));
+                close_pipe(&mut state, &conn_id);
+            }
         }
     } else {
         // No state for this conn. Possible races: control conn closed
@@ -325,6 +383,53 @@ fn teardown(state: &mut FrontdoorState, conn_id: &str) {
     let _ = tcp_close(conn_id.to_string());
 }
 
+#[export(name = "theater:simple/timer.handle-tick")]
+fn handle_tick(state: FrontdoorState, name: String) -> Result<(FrontdoorState, ()), String> {
+    let mut state = state;
+    if name != IDLE_SWEEP_TIMER {
+        // Not ours — ignore (frontdoor arms only the idle sweeper today).
+        return Ok((state, ()));
+    }
+    state.tick = state.tick.wrapping_add(1);
+    let now = state.tick;
+
+    // Reap stale pipes (idle in BOTH directions past the budget). close() is
+    // shutdown(WRITE) only and does not cancel the read loop, so a pipe whose
+    // peer vanished without a FIN would otherwise pin its FD forever. Collect
+    // first, then close_pipe each (close_pipe mutates state.pipes).
+    let stale_pipes: Vec<String> = state
+        .pipes
+        .iter()
+        .filter(|p| now.wrapping_sub(p.last_tick) > IDLE_PIPE_TICKS)
+        .map(|p| p.a.clone())
+        .collect();
+    for cid in stale_pipes {
+        log(format!("[frontdoor] idle-sweep: reaping idle pipe {}", cid));
+        close_pipe(&mut state, &cid);
+    }
+
+    // Reap abandoned pendings (connected but no classifiable request in time).
+    // `control` conns are long-lived command channels — never reap them.
+    let stale_pending: Vec<String> = state
+        .pending
+        .iter()
+        .filter(|p| p.kind != "control" && now.wrapping_sub(p.last_tick) > IDLE_PENDING_TICKS)
+        .map(|p| p.conn_id.clone())
+        .collect();
+    for cid in stale_pending {
+        if let Some(idx) = find_pending(&state.pending, &cid) {
+            log(format!(
+                "[frontdoor] idle-sweep: dropping abandoned pending {}",
+                cid
+            ));
+            state.pending.swap_remove(idx);
+            let _ = tcp_close(cid);
+        }
+    }
+
+    Ok((state, ()))
+}
+
 // ───────────────────── connection state machine ──────────────────────
 
 /// Handle a chunk of bytes arriving on a connection that is still in
@@ -336,8 +441,10 @@ fn handle_pending_data(state: &mut FrontdoorState, idx: usize, data: Vec<u8>) {
     let conn_id;
     let new_buf;
     let kind;
+    let tick = state.tick;
     {
         let p = &mut state.pending[idx];
+        p.last_tick = tick; // activity — keep this conn off the idle sweeper
         if p.kind == "unknown" {
             if let Some(b) = data.first() {
                 p.kind = classify(*b).to_string();
@@ -484,6 +591,7 @@ fn promote_to_pipe(
     state.pipes.push(Pipe {
         a: inbound.clone(),
         b: outbound.clone(),
+        last_tick: state.tick,
     });
     log(format!(
         "[frontdoor] piped {} sni={} -> {} backend={}",
@@ -632,6 +740,18 @@ fn json_str(s: &str) -> String {
 
 fn find_pending(pending: &[Pending], conn_id: &str) -> Option<usize> {
     pending.iter().position(|p| p.conn_id == conn_id)
+}
+
+/// Mark the pipe containing `conn_id` active (bump its `last_tick` to the
+/// current sweep tick) so the idle sweeper won't reap it. Either leg counts.
+fn touch_pipe(state: &mut FrontdoorState, conn_id: &str) {
+    let t = state.tick;
+    for p in state.pipes.iter_mut() {
+        if p.a == conn_id || p.b == conn_id {
+            p.last_tick = t;
+            return;
+        }
+    }
 }
 
 fn find_peer(pipes: &[Pipe], conn_id: &str) -> Option<String> {
