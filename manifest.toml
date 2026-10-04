@@ -19,6 +19,13 @@ type = "runtime"
 [[handler]]
 type = "tcp"
 
+# Pair-idle sweeper: frontdoor arms a single periodic timer ("idle-sweep")
+# and reaps connections idle past their budget in handle-tick. close() is
+# shutdown(WRITE)-only and doesn't cancel the read loop, so without this a
+# peer that vanishes without a FIN leaks its FD (prod incident 2026-10-03).
+[[handler]]
+type = "timer"
+
 # Frontdoor never spawns child actors in v0 (singleton design — see
 # DESIGN.md §6) but it IS supervised BY sentinel, so the supervisor
 # handler is still needed for chain bookkeeping.
